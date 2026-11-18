@@ -257,6 +257,7 @@ const DEFAULT = [
 let S = {segs:DEFAULT.map(s=>({...s})), i:0, run:false, rem:DEFAULT[0].m*60000, endAt:0,
          msg:'', flash:0, black:false, warn:2, fin:0.5};
 let driver = false, heard = false, lastFlash = null;
+const bootAt = Date.now();
 
 const store = {
   get(){ try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch(e) { return null; } },
@@ -323,13 +324,14 @@ const cloud = {clients:[], key:null, lastTs:0, topic:'', up:0, err:''};
 async function cloudStart(){
   cloudStop();
   if (!room) return cloudStatus();
-  if (!window.mqtt || !(window.crypto && crypto.subtle)) { cloud.err = window.mqtt ? 'needs https' : 'library missing'; return cloudStatus(); }
+  if (!(window.crypto && crypto.subtle)) { cloud.err = 'needs https'; return cloudStatus(); }
   try { cloud.key = await crypto.subtle.importKey('raw', ub64u(room.key), 'AES-GCM', false, ['encrypt','decrypt']); }
   catch(e) { cloud.err = 'bad key'; return cloudStatus(); }
   cloud.topic = 'cuetimer/v1/' + room.id;
-  for (const url of BROKERS) {
+  webStart();
+  for (const url of (window.mqtt ? BROKERS : [])) {
     let c;
-    try { c = mqtt.connect(url, {clientId:'cue_' + ID + '_' + Math.random().toString(36).slice(2,6), keepalive:20, reconnectPeriod:2500, connectTimeout:9000, clean:true}); }
+    try { c = mqtt.connect(url, {clientId:'cue_' + ID + '_' + Math.random().toString(36).slice(2,6), keepalive:20, reconnectPeriod:6000, connectTimeout:9000, clean:true}); }
     catch(e) { continue; }
     c.on('connect', () => { c.subscribe(cloud.topic, {qos:0}); cloudStatus(); if (driver) cloudSend(); });
     c.on('close', cloudStatus); c.on('offline', cloudStatus); c.on('error', () => {});
@@ -338,18 +340,71 @@ async function cloudStart(){
   }
   cloudStatus();
 }
-function cloudStop(){ for (const c of cloud.clients) { try { c.end(true); } catch(e) {} } cloud.clients = []; cloud.lastTs = 0; }
+function cloudStop(){ for (const c of cloud.clients) { try { c.end(true); } catch(e) {} } cloud.clients = []; cloud.lastTs = 0; webStop(); }
 async function cloudSend(){
   if (!cloud.key || VIEWER) return;
   const live = cloud.clients.filter(c => c.connected);
   if (!live.length) return;
+  try { const msg = await sealed(); for (const c of live) c.publish(cloud.topic, msg, {qos:0, retain:true}); } catch(e) {}
+}
+async function sealed(){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, cloud.key, new TextEncoder().encode(JSON.stringify(wire()))));
+  const buf = new Uint8Array(12 + ct.length); buf.set(iv); buf.set(ct, 12);
+  return b64u(buf);
+}
+
+/* ---------- transport 1b: web relay (ntfy.sh over plain HTTPS) ----------
+   Gets through school/office/venue networks that block MQTT and WebSockets.
+   Free tier: 250 updates/day per network, so it only sends real changes (no heartbeat),
+   bundled 0.7 s apart. Viewers count down on their own between updates. */
+const NTFY = CFG.ntfy === false ? '' : (CFG.ntfy || 'https://ntfy.sh');
+const web = {es:null, open:false, ok:null, left:null, timer:null, err:'', checked:0};
+function webStart(){
+  webStop();
+  if (!NTFY || !room) return;
+  const topic = 'cuetimer-' + room.id;
+  web.url = NTFY + '/' + topic;
+  if (VIEWER) {
+    try {
+      const es = new EventSource(web.url + '/sse?since=latest');
+      es.onopen = () => { web.open = true; cloudStatus(); };
+      es.onerror = () => { web.open = false; cloudStatus(); };
+      es.onmessage = e => {
+        try {
+          const m = JSON.parse(e.data);
+          if (m.event && m.event !== 'message') return;
+          cloudRecv(m.message, Date.now()/1000 - (m.time || 0) > 3);   // older than 3 s = stored copy
+        } catch(_) {}
+      };
+      web.es = es;
+    } catch(e) {}
+  } else {
+    webCheck(true);
+  }
+}
+function webStop(){ if (web.es) { try { web.es.close(); } catch(e) {} } web.es = null; web.open = false; clearTimeout(web.timer); }
+function webQueue(){
+  if (VIEWER || !NTFY || !cloud.key || !web.url) return;
+  clearTimeout(web.timer); web.timer = setTimeout(webPublish, 700);
+}
+async function webPublish(){
   try {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM', iv}, cloud.key, new TextEncoder().encode(JSON.stringify(wire()))));
-    const buf = new Uint8Array(12 + ct.length); buf.set(iv); buf.set(ct, 12);
-    const msg = b64u(buf);
-    for (const c of live) c.publish(cloud.topic, msg, {qos:0, retain:true});
-  } catch(e) {}
+    const r = await fetch(web.url, {method:'POST', body: await sealed()});
+    web.ok = r.ok; web.err = r.status === 429 ? 'daily limit reached' : (r.ok ? '' : 'error ' + r.status);
+    if (web.left != null && r.ok) web.left = Math.max(0, web.left - 1);
+  } catch(e) { web.ok = false; web.err = 'unreachable'; }
+  cloudStatus(); webCheck();
+}
+async function webCheck(force){
+  if (!force && Date.now() - web.checked < 30000) return;
+  web.checked = Date.now();
+  try {
+    const j = await fetch(NTFY + '/v1/account', {cache:'no-store'}).then(r => r.json());
+    web.left = j.stats ? j.stats.messages_remaining : null;
+    if (web.ok === null) web.ok = true;
+  } catch(e) { if (web.ok === null) web.ok = false; }
+  cloudStatus();
 }
 async function cloudRecv(payload, retained){
   try {
@@ -362,14 +417,18 @@ async function cloudRecv(payload, retained){
     receive(d);
   } catch(e) {}
 }
+function cloudOn(){ return !!(cloud.up || (VIEWER ? web.open : web.ok)); }
 function cloudStatus(){
   cloud.up = cloud.clients.filter(c => c.connected).length;
   const el = $('#syCloud');
   if (el) {
-    el.className = 'sy ' + (cloud.up ? 'ok' : (cloud.err ? '' : 'warn'));
-    el.lastChild.textContent = cloud.up ? `Internet sync: on (${cloud.up}/${BROKERS.length} relays)`
+    const on = cloudOn(), via = [];
+    if (cloud.up) via.push(`direct ${cloud.up}/${BROKERS.length}`);
+    if (web.ok) via.push('web relay' + (web.left != null ? ` · ${web.left} updates left today` : ''));
+    el.className = 'sy ' + (on ? (web.err && !cloud.up ? 'warn' : 'ok') : (cloud.err ? '' : 'warn'));
+    el.lastChild.textContent = on ? `Internet sync: on (${via.join(' + ')})${web.err ? ' — web relay ' + web.err : ''}`
       : cloud.err ? `Internet sync off — ${cloud.err}` : 'Internet sync: connecting… (no internet?)';
-    $('#cardCloud').classList.toggle('off', !cloud.up);
+    $('#cardCloud').classList.toggle('off', !on);
   }
   render();
 }
@@ -403,7 +462,7 @@ function lanStatus(){
 }
 
 /* ---------- send to every transport ---------- */
-function broadcast(){ lanSend(); cloudSend(); }
+function broadcast(){ lanSend(); cloudSend(); webQueue(); }
 setInterval(() => { if (driver) { cloudSend(); save(); } }, 2000);      // heartbeat keeps late joiners exact
 setTimeout(() => { if (!VIEWER && !heard) { driver = true; broadcast(); } }, 3500);
 
@@ -431,7 +490,7 @@ function toggleQR(){
   const o = $('#qrOv');
   if (o.classList.toggle('on')) {
     const L = links(), cards = [];
-    if (L.cloud && (cloud.up || !L.lan)) cards.push(`<div class="big"><h2>Scan for the panel timer</h2><div class="qr">${qrImg(L.cloud, 12)}</div><p>Any wifi or mobile data</p></div>`);
+    if (L.cloud && (cloudOn() || !L.lan)) cards.push(`<div class="big"><h2>Scan for the panel timer</h2><div class="qr">${qrImg(L.cloud, 12)}</div><p>Any wifi or mobile data</p></div>`);
     if (L.lan) cards.push(`<div class="big"><h2>${cards.length ? 'No internet? Use this' : 'Scan for the panel timer'}</h2><div class="qr">${qrImg(L.lan, 12)}</div><p>Join this wifi first</p></div>`);
     o.innerHTML = cards.join('') || '<p>No link available</p>';
     o.classList.toggle('one', cards.length === 1);
@@ -480,7 +539,7 @@ const A = {
   flash:()=>{ S.flash++; commit(); }, black:()=>{ S.black = !S.black; commit(); },
   clear:()=>setMsg(''), output:()=>setMode('out'), ctrl:()=>setMode('ctrl'), fs,
   qr:toggleQR, copy:copyLink,
-  newRoom:()=>{ room = newRoomObj(); save(); drawQRs(); cloudStart().then(() => { driver = true; }); },
+  newRoom:()=>{ room = newRoomObj(); save(); drawQRs(); cloudStart().then(() => { driver = true; broadcast(); }); },
   addSeg:()=>{ S.segs.push({n:'New segment', m:5}); commit(true); },
   go:(b)=>go(+b.dataset.k),
   del:(b)=>{
@@ -562,7 +621,7 @@ function render(){
   put('next', nx ? `Next · ${nx.n} · ${fmt(segMs(S.i+1))}` : 'Final segment');
   let left = Math.max(r, 0); for (let k = S.i+1; k < S.segs.length; k++) left += segMs(k);
   put('total', `Show ${fmt(left)} left · ends ${hm(new Date(Date.now() + left))}`);
-  const lost = VIEWER && (LAN_VIEWER ? lan.online === false : (cloud.clients.length && !cloud.up));
+  const lost = VIEWER && (LAN_VIEWER ? lan.online === false : (Date.now() - bootAt > 8000 && !cloudOn()));
   put('clock', (lost ? 'reconnecting… · ' : '') + hm(new Date()));
 
   const st = $('#stage'), cls = ['num'];

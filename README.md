@@ -12,7 +12,7 @@ A minimal on-stage countdown for moderating panels and fireside chats. You run i
 
 | | **Anywhere** (GitHub Pages) | **This wifi only** (`cue.py`) |
 |---|---|---|
-| Panelists' phones need | Any internet: venue wifi or mobile data | The same wifi as your laptop |
+| Panelists' phones need | Any internet: venue wifi (even strict ones) or mobile data | The same wifi as your laptop |
 | Venue internet needed | Yes | No |
 | Setup on the day | Open your GitHub Pages link | Run `python3 cue.py` |
 
@@ -55,6 +55,11 @@ Run `cue.py` and you get **both** QR codes: the Anywhere code while the laptop i
 
 ## How it works and privacy
 
-GitHub Pages only serves the page; it can't pass the countdown between devices. For that, the "Anywhere" mode sends the timer state through free public relays (HiveMQ and EMQX, used together so one can fail). Every message is **encrypted in your browser** with a key that exists only in the QR link. The relays can't read your segment names or messages, and only someone with the QR can open the view. The wifi mode never leaves your local network.
+GitHub Pages only serves the page; it can't pass the countdown between devices. "Anywhere" mode sends the timer state through free public relays, using whichever ones the network lets through:
+
+- **Direct relays** (HiveMQ and EMQX over MQTT): instant, no limits. School, office and venue wifi often block them.
+- **Web relay** ([ntfy.sh](https://ntfy.sh)) over plain HTTPS: gets through strict networks. The free tier allows **250 updates a day per network**, so Cue only sends real changes (start, pause, next, cues), about 40–80 for a typical show. Phones count down on their own between updates. The control panel shows how many updates are left today.
+
+Every message is **encrypted in your browser** with a key that exists only in the QR link. The relays can't read your segment names or messages, and only someone with the QR can open the view. The wifi mode (`cue.py`) never leaves your local network.
 
 Bundled libraries (MIT): [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator), [NoSleep.js](https://github.com/richtr/NoSleep.js), [MQTT.js](https://github.com/mqttjs/MQTT.js).
